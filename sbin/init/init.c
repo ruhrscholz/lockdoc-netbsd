@@ -133,6 +133,7 @@ typedef state_func_t (*state_t)(void);
 #define	CATATONIA	'c'
 
 static state_func_t single_user(void);
+static state_func_t start_lockdoc(void);
 #ifndef LETS_GET_SMALL
 static state_func_t runcom(void);
 static state_func_t read_ttys(void);
@@ -276,13 +277,16 @@ main(int argc, char **argv)
 	 * This code assumes that we always get arguments through flags,
 	 * never through bits set in some random machine register.
 	 */
-	while ((c = getopt(argc, argv, "sf")) != -1)
+	while ((c = getopt(argc, argv, "sfl")) != -1)
 		switch (c) {
 		case 's':
 			requested_transition = single_user;
 			break;
 		case 'f':
 			runcom_mode = FASTBOOT;
+			break;
+		case 'l':
+			requested_transition = start_lockdoc;
 			break;
 		default:
 			warning("unrecognized flag `%c'", c);
@@ -818,6 +822,108 @@ single_user(void)
 	return (state_func_t)single_user;
 #endif /* LETS_GET_SMALL */
 }
+
+/*
+ * Bring the system up single user.
+ */
+static state_func_t
+start_lockdoc(void)
+{
+	pid_t pid, wpid;
+	int status;
+	int from_securitylevel;
+	sigset_t mask;
+	struct sigaction sa, satstp, sahup;
+	
+	/*
+	 * If the kernel is in secure mode, downgrade it to insecure mode.
+	 */
+	from_securitylevel = getsecuritylevel();
+	if (from_securitylevel > 0)
+		setsecuritylevel(0);
+
+	(void)sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sa.sa_handler = SIG_IGN;
+	(void)sigaction(SIGTSTP, &sa, &satstp);
+	(void)sigaction(SIGHUP, &sa, &sahup);
+	if ((pid = fork()) == 0) {
+		/*
+		 * Start the single user session.
+		 */
+		if (access(_PATH_CONSTTY, F_OK) == 0)
+			setctty(_PATH_CONSTTY);
+		else
+			setctty(_PATH_CONSOLE);
+
+		/*
+		 * Unblock signals.
+		 * We catch all the interesting ones,
+		 * and those are reset to SIG_DFL on exec.
+		 */
+		(void)sigemptyset(&mask);
+		(void)sigprocmask(SIG_SETMASK, &mask, NULL);
+
+		/*
+		 * Fire off a shell.
+		 * If the default one doesn't work, try the Bourne shell.
+		 */
+		(void)setenv("PATH", INIT_PATH, 1);
+
+		(void)execv("/usr/pkg/bin/bash", __UNCONST("/lockdoc/run-bench.sh"));
+		emergency("can't exec /lockdoc/run-bench.sh for single user: %m");
+		(void)sleep(STALL_TIMEOUT);
+		_exit(3);
+	}
+
+	requested_transition = 0;
+	do {
+		if ((wpid = waitpid(-1, &status, WUNTRACED)) != -1)
+			collect_child(wpid, status);
+		if (wpid == -1) {
+			if (errno == EINTR)
+				continue;
+			warning("wait for single-user shell failed: %m; "
+			    "restarting");
+			return (state_func_t)single_user;
+		}
+		if (wpid == pid && WIFSTOPPED(status)) {
+			warning("shell stopped, restarting");
+			(void)kill(pid, SIGCONT);
+			wpid = -1;
+		}
+	} while (wpid != pid && !requested_transition);
+
+	if (requested_transition) {
+		(void)sigaction(SIGTSTP, &satstp, NULL);
+		(void)sigaction(SIGHUP, &sahup, NULL);
+		return (state_func_t)requested_transition;
+	}
+
+	if (WIFSIGNALED(status)) {
+		if (WTERMSIG(status) == SIGKILL) {
+			/* executed /sbin/reboot; wait for the end quietly */
+			sigset_t s;
+	
+			(void)sigfillset(&s);
+			for (;;)
+				(void)sigsuspend(&s);
+		} else {	
+			warning("single user shell terminated (%x), restarting",
+				status);
+			(void)sigaction(SIGTSTP, &satstp, NULL);
+			(void)sigaction(SIGHUP, &sahup, NULL);
+			return (state_func_t)single_user;
+		}
+	}
+
+	runcom_mode = FASTBOOT;
+	(void)sigaction(SIGTSTP, &satstp, NULL);
+	(void)sigaction(SIGHUP, &sahup, NULL);
+	
+	return (state_func_t)runcom;
+}
+
 
 #ifndef LETS_GET_SMALL
 

@@ -944,6 +944,9 @@ check_console(struct lwp *l)
  * List of paths to try when searching for "init".
  */
 static const char * const initpaths[] = {
+#ifdef LOCKDOC
+	"/lockdoc/init",
+#endif
 	"/sbin/init",
 	"/sbin/oinit",
 	"/sbin/init.bak",
